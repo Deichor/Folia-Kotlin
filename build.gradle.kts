@@ -33,9 +33,16 @@ paperweight {
 
 val paperMavenPublicUrl = "https://repo.papermc.io/repository/maven-public/"
 
+// Bukkit API version reported by Server.getBukkitVersion(). Without this the project version
+// defaults to "unspecified", which breaks plugins that parse the version string (e.g.
+// PlaceholderAPI does getBukkitVersion().split("-")[0].split(".")[2] → ArrayIndexOutOfBounds).
+version = "${providers.gradleProperty("mcVersion").get().trim()}-R0.1-SNAPSHOT"
+
 subprojects {
     apply(plugin = "java-library")
     apply(plugin = "maven-publish")
+
+    version = rootProject.version
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
