@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deichor <deichors@gmail.com>
+Date: Fri, 7 Aug 2026 03:55:27 +0300
+Subject: [PATCH] Expose markClientLoaded for seamless backend switching
+
+
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index c1faaf7d514c23d756aa626fa93aabd8bb503463..f3811b3d3fd1ef91951560ff76920a51f48e3b77 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -3881,6 +3881,26 @@ public class ServerGamePacketListenerImpl
+         this.clientLoadedTimeoutTimer = 0;
+     }
+ 
++    // Tessera start - seamless backend switching
++    /**
++     * Marks the client as having finished loading the level, without waiting for it to say so.
++     *
++     * <p>A seamless proxy switch deliberately sends the client no Respawn and no Login, which is
++     * the only way to keep its {@code LevelLoadingScreen} from being armed. The side effect is that
++     * the client's level-load tracker never runs either, so it never sends
++     * {@code ServerboundPlayerLoadedPacket} — and this connection would sit behind
++     * {@link #hasClientLoaded()} (checked by the movement and interaction handlers) until
++     * {@code CLIENT_LOADED_TIMEOUT_TIME} expires, silently discarding everything the player does
++     * for those ~2 seconds and then overwriting their client's prediction.
++     *
++     * <p>Called by the Tessera plugin when the proxy signals that this connection arrived through a
++     * seamless switch. Normal logins are untouched: there the client reports for itself.
++     */
++    public void tesseraMarkClientLoaded() {
++        this.markClientLoaded(false);
++    }
++    // Tessera end
++
+     public void markClientUnloadedAfterDeath() {
+         this.waitingForRespawn = true;
+     }
