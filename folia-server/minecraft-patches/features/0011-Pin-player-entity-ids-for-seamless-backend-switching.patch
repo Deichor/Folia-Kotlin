@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deichor <deichors@gmail.com>
+Date: Fri, 7 Aug 2026 03:25:54 +0300
+Subject: [PATCH] Pin player entity ids for seamless backend switching
+
+
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index e7579a9873362317dd82b63306cf650af9472574..7045345b145de0349c8d4dc507629cbefa94b0f1 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -220,6 +220,17 @@ public abstract class PlayerList {
+ 
+     abstract public void loadAndSaveFiles(); // Paper - fix converting txt to json file; moved from DedicatedPlayerList constructor
+ 
++    // Tessera start - pinned entity ids for seamless backend switching
++    /**
++     * Resolves a stable, cross-backend entity id for a player UUID, or {@code 0} to leave the
++     * server-assigned id alone. Installed by the Tessera plugin, which backs it with a Redis
++     * counter so every shard/lobby of an environment agrees. Called on the login thread, so the
++     * provider must not block — the plugin resolves the id on {@code AsyncPlayerPreLoginEvent}
++     * and only reads its cache here.
++     */
++    public static volatile java.util.function.ToIntFunction<java.util.UUID> tesseraEntityIdPin = null;
++    // Tessera end
++
+     public void placeNewPlayer(final Connection connection, final ServerPlayer player, final CommonListenerCookie cookie) {
+         player.isRealPlayer = true; // Paper
+         player.loginTime = System.currentTimeMillis(); // Paper - Replace OfflinePlayer#getLastPlayed
+@@ -245,6 +256,20 @@ public abstract class PlayerList {
+         boolean immediateRespawn = gameRules.get(GameRules.IMMEDIATE_RESPAWN);
+         boolean reducedDebugInfo = gameRules.get(GameRules.REDUCED_DEBUG_INFO);
+         boolean doLimitedCrafting = gameRules.get(GameRules.LIMITED_CRAFTING);
++        // Tessera start - pinned entity ids for seamless backend switching
++        // A seamless proxy switch sends the client no JoinGame/Respawn, so the client keeps the
++        // LocalPlayer entity id the *previous* backend handed out. Every backend must therefore
++        // agree on one id per player, or this backend's packets about the player would refer to
++        // an entity the client does not think is itself. Must run before ClientboundLoginPacket
++        // (which carries the id) and before level.addNewPlayer (which keys the entity by id).
++        final java.util.function.ToIntFunction<java.util.UUID> entityIdPin = tesseraEntityIdPin;
++        if (entityIdPin != null) {
++            final int pinnedId = entityIdPin.applyAsInt(gameProfile.id());
++            if (pinnedId != 0 && pinnedId != player.getId()) {
++                player.setId(pinnedId);
++            }
++        }
++        // Tessera end
+         playerConnection.send(
+             new ClientboundLoginPacket(
+                 player.getId(),
