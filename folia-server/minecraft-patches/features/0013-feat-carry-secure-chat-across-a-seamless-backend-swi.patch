@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: deichor <deichors@gmail.com>
+Date: Fri, 7 Aug 2026 06:57:04 +0300
+Subject: [PATCH] feat: carry secure chat across a seamless backend switch
+
+Port of the Paper fork's patch, which applied unchanged. A no-Respawn
+switch strands the client's chat state, because Login is the only thing
+that resets it; without this a premium player is kicked with
+chat_validation_failed about a second after crossing a shard boundary.
+Also carries the signed-chat relay so a message can cross backends and
+still verify on the receiving client.
+
+diff --git a/net/minecraft/network/chat/LastSeenMessagesValidator.java b/net/minecraft/network/chat/LastSeenMessagesValidator.java
+index e17b162eaccbba50d56900b4f3475d49006454e7..8db46d22e0cee9ee5670528a010a9c28c974b86e 100644
+--- a/net/minecraft/network/chat/LastSeenMessagesValidator.java
++++ b/net/minecraft/network/chat/LastSeenMessagesValidator.java
+@@ -2,6 +2,7 @@ package net.minecraft.network.chat;
+ 
+ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+ import it.unimi.dsi.fastutil.objects.ObjectList;
++import java.util.List;
+ import org.jspecify.annotations.Nullable;
+ 
+ public class LastSeenMessagesValidator {
+@@ -17,6 +18,29 @@ public class LastSeenMessagesValidator {
+         }
+     }
+ 
++    // Tessera start - carry the acknowledgement window across a seamless switch
++    /**
++     * The client keeps acknowledging messages it saw on the source backend, and its tracker is only
++     * cleared by a Login packet. A destination that starts with an empty window rejects the very
++     * first acknowledgement — "Advanced last seen window by N messages, but expected at most 0" —
++     * and kicks the player with {@code chat_validation_failed} about a second after the switch,
++     * without them having typed anything.
++     */
++    public List<@Nullable LastSeenTrackedEntry> tesseraExport() {
++        return new java.util.ArrayList<>(this.trackedMessages);
++    }
++
++    public @Nullable MessageSignature tesseraLastPending() {
++        return this.lastPendingMessage;
++    }
++
++    public void tesseraImport(final List<@Nullable LastSeenTrackedEntry> entries, final @Nullable MessageSignature lastPending) {
++        this.trackedMessages.clear();
++        this.trackedMessages.addAll(entries);
++        this.lastPendingMessage = lastPending;
++    }
++    // Tessera end - carry the acknowledgement window across a seamless switch
++
+     public void addPending(final MessageSignature message) {
+         if (!message.equals(this.lastPendingMessage)) {
+             this.trackedMessages.add(new LastSeenTrackedEntry(message, true));
+diff --git a/net/minecraft/network/chat/MessageSignatureCache.java b/net/minecraft/network/chat/MessageSignatureCache.java
+index 5d934160cfa48020a63be436ff376d8a1211455b..f3984156fdf5039adb9c816cf5e2da9cebf39911 100644
+--- a/net/minecraft/network/chat/MessageSignatureCache.java
++++ b/net/minecraft/network/chat/MessageSignatureCache.java
+@@ -3,6 +3,7 @@ package net.minecraft.network.chat;
+ import com.google.common.annotations.VisibleForTesting;
+ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ import java.util.ArrayDeque;
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.Set;
+ import org.jspecify.annotations.Nullable;
+@@ -20,6 +21,22 @@ public class MessageSignatureCache {
+         return new MessageSignatureCache(128);
+     }
+ 
++    // Tessera start - carry the cache across a seamless switch
++    /**
++     * The client indexes packed signatures against its own copy of this table, and only a Login
++     * packet rebuilds it. A destination backend that starts from an empty table would emit ids
++     * resolving to different messages on the client, so the switch has to carry the table over.
++     */
++    public @Nullable MessageSignature[] tesseraExport() {
++        return this.entries.clone();
++    }
++
++    public void tesseraImport(final @Nullable MessageSignature[] snapshot) {
++        Arrays.fill(this.entries, null);
++        System.arraycopy(snapshot, 0, this.entries, 0, Math.min(snapshot.length, this.entries.length));
++    }
++    // Tessera end - carry the cache across a seamless switch
++
+     public int pack(final MessageSignature signature) {
+         for (int i = 0; i < this.entries.length; i++) {
+             if (signature.equals(this.entries[i])) {
+diff --git a/net/minecraft/network/chat/SignedMessageChain.java b/net/minecraft/network/chat/SignedMessageChain.java
+index 9395c6a58ba37fb00c492065b8045f54de0a2246..533852572c71fb33b5c31ca1926125468ca095d1 100644
+--- a/net/minecraft/network/chat/SignedMessageChain.java
++++ b/net/minecraft/network/chat/SignedMessageChain.java
+@@ -2,6 +2,7 @@ package net.minecraft.network.chat;
+ 
+ import com.mojang.logging.LogUtils;
+ import java.time.Instant;
++import java.util.Objects;
+ import java.util.UUID;
+ import java.util.function.BooleanSupplier;
+ import net.minecraft.util.SignatureValidator;
+@@ -19,6 +20,37 @@ public class SignedMessageChain {
+         this.nextLink = SignedMessageLink.root(profileId, sessionId);
+     }
+ 
++    // Tessera start - resume a chain on another connection
++    /**
++     * A seamless proxy switch gives the destination a client whose signing chain is already part-way
++     * through. The client cannot be told to start over — only a Login packet resets its encoder — so
++     * the destination has to pick the chain up where the source left it, or every signature it
++     * verifies will be computed over the wrong index and the player's chat dies with
++     * {@code chat.disabled.invalid_signature}.
++     */
++    public void tesseraResumeAt(final int index, final Instant lastTimeStamp) {
++        this.nextLink = index < 0 ? null : new SignedMessageLink(index, this.expectedSender(), this.expectedSession());
++        this.lastTimeStamp = lastTimeStamp;
++    }
++
++    /** Index the next message is expected to carry, or -1 once the chain is broken. */
++    public int tesseraNextIndex() {
++        return this.nextLink == null ? -1 : this.nextLink.index();
++    }
++
++    public Instant tesseraLastTimeStamp() {
++        return this.lastTimeStamp;
++    }
++
++    private UUID expectedSender() {
++        return Objects.requireNonNull(this.nextLink, "chain already broken").sender();
++    }
++
++    private UUID expectedSession() {
++        return Objects.requireNonNull(this.nextLink, "chain already broken").sessionId();
++    }
++    // Tessera end - resume a chain on another connection
++
+     public SignedMessageChain.Encoder encoder(final Signer signer) {
+         return body -> {
+             SignedMessageLink link = this.nextLink;
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b8cc3902f 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -50,8 +50,16 @@ import net.minecraft.network.HashedStack;
+ import net.minecraft.network.TickablePacketListener;
+ import net.minecraft.network.chat.ChatType;
+ import net.minecraft.network.chat.Component;
++import java.time.Instant; // Tessera - chat state handover
++import net.minecraft.network.FriendlyByteBuf; // Tessera - chat state handover
+ import net.minecraft.network.chat.LastSeenMessages;
+ import net.minecraft.network.chat.LastSeenMessagesValidator;
++import net.minecraft.network.chat.LastSeenTrackedEntry; // Tessera - chat state handover
++import net.minecraft.network.chat.ComponentSerialization; // Tessera - relayed chat
++import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket; // Tessera - relayed chat
++import net.minecraft.network.chat.SignedMessageLink; // Tessera - relayed chat
++import net.minecraft.network.chat.FilterMask; // Tessera - relayed chat
++import java.util.UUID; // Tessera - relayed chat
+ import net.minecraft.network.chat.MessageSignature;
+ import net.minecraft.network.chat.MessageSignatureCache;
+ import net.minecraft.network.chat.PlayerChatMessage;
+@@ -318,6 +326,11 @@ public class ServerGamePacketListenerImpl
+     private @Nullable RemoteChatSession chatSession;
+     private boolean hasLoggedExpiry = false; // Paper - Prevent causing expired keys from impacting new joins
+     private SignedMessageChain.Decoder signedMessageDecoder;
++    private @Nullable SignedMessageChain signedMessageChain; // Tessera - kept so a seamless switch can hand the chain to the next backend
++    // Tessera start - senders introduced to this client on behalf of another backend
++    private static final int MAX_RELAYED_SENDERS = 64;
++    private final java.util.LinkedHashSet<UUID> relayedSenders = new java.util.LinkedHashSet<>();
++    // Tessera end - senders introduced to this client on behalf of another backend
+     private final LastSeenMessagesValidator lastSeenMessages = new LastSeenMessagesValidator(20);
+     private int nextChatIndex;
+     private final MessageSignatureCache messageSignatureCache = MessageSignatureCache.createDefault();
+@@ -2820,12 +2833,18 @@ public class ServerGamePacketListenerImpl
+     }
+ 
+     public void sendPlayerChatMessage(final PlayerChatMessage message, final ChatType.Bound chatType) {
+-        // CraftBukkit start - SPIGOT-7262: if hidden we have to send as disguised message. Query whether we should send at all (but changing this may not be expected).
+-        if (!this.getCraftPlayer().canSeePlayer(message.link().sender())) {
++        // Tessera start - an absent sender is a relayed message, not a hidden player
++        // canSeePlayer(uuid) answers false for any uuid it cannot resolve to an online player, so a
++        // message relayed from another backend of the network would be silently downgraded to
++        // disguised chat and lose its signature — the client would render it "Not Secure" and it
++        // would not be reportable. Only downgrade when the sender is genuinely here and hidden.
++        // CraftBukkit - SPIGOT-7262: if hidden we have to send as disguised message.
++        final org.bukkit.entity.Player localSender = org.bukkit.Bukkit.getPlayer(message.link().sender());
++        if (localSender != null && !this.getCraftPlayer().canSee(localSender)) {
+             this.sendDisguisedChatMessage(message.decoratedContent(), chatType);
+             return;
+         }
+-        // CraftBukkit end
++        // Tessera end - an absent sender is a relayed message, not a hidden player
+         // Paper start - Ensure that client receives chat packets in the same order that we add into the message signature cache
+         synchronized (this.messageSignatureCache) {
+         this.send(
+@@ -3805,7 +3824,10 @@ public class ServerGamePacketListenerImpl
+     private void resetPlayerChatState(final RemoteChatSession chatSession) {
+         this.chatSession = chatSession;
+         this.hasLoggedExpiry = false; // Paper - Prevent causing expired keys from impacting new joins
+-        this.signedMessageDecoder = chatSession.createMessageDecoder(this.player.getUUID());
++        // Tessera start - keep the chain itself, not just the decoder built from it
++        this.signedMessageChain = new SignedMessageChain(this.player.getUUID(), chatSession.sessionId());
++        this.signedMessageDecoder = this.signedMessageChain.decoder(chatSession.profilePublicKey());
++        // Tessera end - keep the chain itself, not just the decoder built from it
+         this.chatMessageChain
+             .append(
+                 () -> {
+@@ -3821,6 +3843,260 @@ public class ServerGamePacketListenerImpl
+             );
+     }
+ 
++    // Tessera start - hand the connection's chat state to the next backend
++    private static final int TESSERA_CHAT_STATE_VERSION = 1;
++    private static final int TESSERA_CHAT_STATE_WARN_ENTRIES = 256;
++
++    /**
++     * Snapshots everything about secure chat that lives on this connection rather than on the player.
++     *
++     * A seamless proxy switch sends the client no Login packet, which is the only thing that resets
++     * its own chat state, so the destination inherits a client that is mid-conversation: its signing
++     * chain is at some index, it is still acknowledging messages this backend sent, and it expects
++     * the next {@code ClientboundPlayerChatPacket} to continue a global counter. A destination that
++     * starts fresh disagrees on all three and the player is kicked or silently loses chat. Everything
++     * needed to agree is held here, so the source exports and the destination imports it.
++     *
++     * Opaque bytes on purpose: the transport is a plugin, and keeping the format inside the server
++     * means no NMS type ever has to cross a plugin classloader.
++     *
++     * @return the snapshot, or an empty array when the player has no chat session (offline mode, or a
++     *         client that sent no profile key) and therefore nothing to carry.
++     */
++    public byte[] tesseraExportChatState() {
++        final RemoteChatSession session = this.chatSession;
++        if (session == null) {
++            return new byte[0];
++        }
++
++        final FriendlyByteBuf out = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
++        try {
++            out.writeVarInt(TESSERA_CHAT_STATE_VERSION);
++            RemoteChatSession.Data.write(out, session.asData());
++
++            final SignedMessageChain chain = this.signedMessageChain;
++            out.writeVarInt(chain == null ? -1 : chain.tesseraNextIndex());
++            out.writeLong(chain == null ? 0L : chain.tesseraLastTimeStamp().toEpochMilli());
++            out.writeVarInt(this.nextChatIndex);
++
++            synchronized (this.messageSignatureCache) {
++                final MessageSignature[] cached = this.messageSignatureCache.tesseraExport();
++                out.writeVarInt(cached.length);
++                for (final MessageSignature signature : cached) {
++                    out.writeNullable(signature, MessageSignature::write);
++                }
++            }
++
++            synchronized (this.lastSeenMessages) {
++                final List<LastSeenTrackedEntry> tracked = this.lastSeenMessages.tesseraExport();
++                // Exported whole, never trimmed: the client's acknowledgement offsets are relative to
++                // this exact list, so a shorter one makes the destination reject the first ack and
++                // kick the player. The size is bounded instead by the server's own backlog limit —
++                // past 4096 pending messages the connection is dropped with too_many_pending_chats —
++                // which puts the ceiling near a megabyte. Anything close to that means the client has
++                // stopped acknowledging, so say so rather than moving a silently huge blob.
++                if (tracked.size() > TESSERA_CHAT_STATE_WARN_ENTRIES) {
++                    LOGGER.warn(
++                        "Chat state for {} carries {} unacknowledged messages; the client may have stopped acknowledging",
++                        this.player.getGameProfile().name(),
++                        tracked.size()
++                    );
++                }
++                out.writeVarInt(tracked.size());
++                for (final LastSeenTrackedEntry entry : tracked) {
++                    out.writeNullable(entry, (buf, e) -> {
++                        MessageSignature.write(buf, e.signature());
++                        buf.writeBoolean(e.pending());
++                    });
++                }
++                out.writeNullable(this.lastSeenMessages.tesseraLastPending(), MessageSignature::write);
++            }
++
++            final byte[] bytes = new byte[out.readableBytes()];
++            out.readBytes(bytes);
++            return bytes;
++        } finally {
++            out.release();
++        }
++    }
++
++    /**
++     * Adopts a snapshot taken by {@link #tesseraExportChatState()} on the connection the player just
++     * left. Must run on the main thread and before the client sends anything, which is why the caller
++     * is the seamless-arrival handler rather than the join sequence.
++     *
++     * @throws IllegalArgumentException if the snapshot is malformed or from a newer server
++     */
++    public void tesseraImportChatState(final byte[] snapshot) {
++        if (snapshot.length == 0) {
++            return;
++        }
++
++        final FriendlyByteBuf in = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapshot));
++        final int version = in.readVarInt();
++        if (version != TESSERA_CHAT_STATE_VERSION) {
++            throw new IllegalArgumentException("Unsupported chat state version " + version);
++        }
++
++        final SignatureValidator serviceKeyValidator = this.server.services().profileKeySignatureValidator();
++        if (serviceKeyValidator == null) {
++            LOGGER.warn("Ignoring chat state for {}: no Services public key to validate it against", this.player.getGameProfile().name());
++            return;
++        }
++
++        final RemoteChatSession session;
++        try {
++            session = RemoteChatSession.Data.read(in).validate(this.player.getGameProfile(), serviceKeyValidator);
++        } catch (final ProfilePublicKey.ValidationException e) {
++            // A session that does not validate here would not have validated on the source either, so
++            // this is a transport bug rather than a hostile client; drop the state and let the player
++            // fall back to unsigned chat instead of disconnecting them.
++            LOGGER.warn("Ignoring chat state for {}: {}", this.player.getGameProfile().name(), e.getMessage());
++            return;
++        }
++
++        final int chainIndex = in.readVarInt();
++        final Instant lastTimeStamp = Instant.ofEpochMilli(in.readLong());
++        final int nextChatIndex = in.readVarInt();
++
++        final int cachedCount = in.readVarInt();
++        final MessageSignature[] cached = new MessageSignature[cachedCount];
++        for (int i = 0; i < cachedCount; i++) {
++            cached[i] = in.readNullable(MessageSignature::read);
++        }
++
++        final int trackedCount = in.readVarInt();
++        final List<LastSeenTrackedEntry> tracked = new java.util.ArrayList<>(trackedCount);
++        for (int i = 0; i < trackedCount; i++) {
++            tracked.add(in.readNullable(buf -> new LastSeenTrackedEntry(MessageSignature.read(buf), buf.readBoolean())));
++        }
++        final MessageSignature lastPending = in.readNullable(MessageSignature::read);
++
++        this.chatSession = session;
++        this.hasLoggedExpiry = false;
++        this.signedMessageChain = new SignedMessageChain(this.player.getUUID(), session.sessionId());
++        this.signedMessageChain.tesseraResumeAt(chainIndex, lastTimeStamp);
++        this.signedMessageDecoder = this.signedMessageChain.decoder(session.profilePublicKey());
++        this.nextChatIndex = nextChatIndex;
++
++        synchronized (this.messageSignatureCache) {
++            this.messageSignatureCache.tesseraImport(cached);
++        }
++        synchronized (this.lastSeenMessages) {
++            this.lastSeenMessages.tesseraImport(tracked, lastPending);
++        }
++
++        this.player.setChatSession(session);
++        this.server
++            .getPlayerList()
++            .broadcastAll(
++                new ClientboundPlayerInfoUpdatePacket(EnumSet.of(ClientboundPlayerInfoUpdatePacket.Action.INITIALIZE_CHAT), List.of(this.player)), this.player
++            );
++    }
++    /**
++     * Replays a message relayed from another backend of the network as genuine signed chat.
++     *
++     * <p>The client resolves the sender through its own player-info map and verifies the signature
++     * against the chat session it holds for them, so both have to be pushed first — which is exactly
++     * what {@code INITIALIZE_CHAT} is for, and it may be sent at any time, not only at login. The
++     * entry is added unlisted so a player who is on a different backend does not appear in this
++     * server's tab list.
++     *
++     * <p>Must run on the main thread. Malformed input is dropped with a warning rather than raised:
++     * the peer is another backend, but the blob still crosses a plugin and a network hop.
++     */
++    public void tesseraDeliverRemoteChat(final byte[] blob) {
++        final FriendlyByteBuf in = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(blob));
++        try {
++            final int version = in.readVarInt();
++            if (version != PlayerList.TESSERA_CHAT_RELAY_VERSION) {
++                LOGGER.warn("Dropping relayed chat with unsupported version {}", version);
++                return;
++            }
++
++            final UUID senderId = in.readUUID();
++            final String senderName = in.readUtf();
++            final com.mojang.authlib.GameProfile senderProfile = new com.mojang.authlib.GameProfile(senderId, senderName);
++            final RemoteChatSession.Data sessionData = RemoteChatSession.Data.read(in);
++
++            final SignatureValidator serviceKeyValidator = this.server.services().profileKeySignatureValidator();
++            if (serviceKeyValidator == null) {
++                return;
++            }
++            final RemoteChatSession session;
++            try {
++                session = sessionData.validate(senderProfile, serviceKeyValidator);
++            } catch (final ProfilePublicKey.ValidationException e) {
++                LOGGER.warn("Dropping relayed chat from {}: {}", senderName, e.getMessage());
++                return;
++            }
++
++            final int linkIndex = in.readVarInt();
++            final ResourceKey<ChatType> chatTypeKey = ResourceKey.create(Registries.CHAT_TYPE, net.minecraft.resources.Identifier.parse(in.readUtf()));
++            final Component boundName = ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC.decode(in);
++            final java.util.Optional<Component> targetName = in.readOptional(ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC::decode);
++            final Component unsignedContent = in.readNullable(ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC::decode);
++            final MessageSignature signature = in.readNullable(MessageSignature::read);
++            final SignedMessageBody body = new SignedMessageBody(
++                in.readUtf(256), Instant.ofEpochMilli(in.readLong()), in.readLong(), new LastSeenMessages(in.readList(MessageSignature::read))
++            );
++
++            introduceRelayedSender(senderId, senderProfile, session);
++
++            // The filter mask is deliberately not relayed: filtering is decided per receiver, and the
++            // source's decision was made for its own players.
++            this.sendPlayerChatMessage(
++                new PlayerChatMessage(
++                    new SignedMessageLink(linkIndex, senderId, session.sessionId()), signature, body, unsignedContent, FilterMask.PASS_THROUGH
++                ),
++                new ChatType.Bound(this.player.level().registryAccess().lookupOrThrow(Registries.CHAT_TYPE).getOrThrow(chatTypeKey), boundName, targetName)
++            );
++        } catch (final RuntimeException e) {
++            LOGGER.warn("Dropping malformed relayed chat: {}", e.toString());
++        }
++    }
++    /**
++     * Makes sure this client can resolve and verify a sender who is on another backend.
++     *
++     * <p>Sent once per sender rather than per message. Repeating it would not merely waste bandwidth:
++     * {@code INITIALIZE_CHAT} rebuilds the client's per-sender validator, so re-sending it before
++     * every message would paper over an out-of-order relay instead of letting the chain reject it.
++     *
++     * <p>The entry is unlisted, so a player on a different backend does not appear in this server's
++     * tab list — but the client still files them under its social manager, which is what keeps the
++     * message reportable and the "hide messages from this player" toggle working.
++     */
++    private void introduceRelayedSender(final UUID senderId, final com.mojang.authlib.GameProfile profile, final RemoteChatSession session) {
++        // A sender who is also on this server already has a real, listed entry; re-adding them would
++        // fight the normal join bookkeeping.
++        if (this.server.getPlayerList().getPlayer(senderId) != null || !this.relayedSenders.add(senderId)) {
++            return;
++        }
++
++        this.send(
++            new ClientboundPlayerInfoUpdatePacket(
++                EnumSet.of(
++                    ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
++                    ClientboundPlayerInfoUpdatePacket.Action.INITIALIZE_CHAT,
++                    ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED
++                ),
++                List.of(new ClientboundPlayerInfoUpdatePacket.Entry(senderId, profile, false, 0, GameType.DEFAULT_MODE, null, true, 0, session.asData()))
++            )
++        );
++
++        while (this.relayedSenders.size() > MAX_RELAYED_SENDERS) {
++            final java.util.Iterator<UUID> oldest = this.relayedSenders.iterator();
++            final UUID evicted = oldest.next();
++            oldest.remove();
++            // Never withdraw someone who has since joined this server for real — vanilla owns their
++            // entry now, and removing it would erase them from the tab list.
++            if (this.server.getPlayerList().getPlayer(evicted) == null) {
++                this.send(new ClientboundPlayerInfoRemovePacket(List.of(evicted)));
++            }
++        }
++    }
++    // Tessera end - hand the connection's chat state to the next backend
++
+     @Override
+     public void handleCustomPayload(final ServerboundCustomPayloadPacket packet) {
+         super.handleCustomPayload(packet); // Paper
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 7045345b145de0349c8d4dc507629cbefa94b0f1..385e5ff968e94e744e227a497da18ee303766416 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -1279,8 +1279,76 @@ public abstract class PlayerList {
+         if (wasFullyFiltered && senderPlayer != null) {
+             senderPlayer.sendSystemMessage(CHAT_FILTERED_FULL);
+         }
++
++        // Tessera start - offer the message to the network relay
++        final java.util.function.Consumer<byte[]> relay = tesseraChatRelay;
++        if (relay != null && senderPlayer != null && message.hasSignature() && senderPlayer.getChatSession() != null) {
++            relay.accept(tesseraEncodeChat(senderPlayer, message, chatType));
++        }
++        // Tessera end - offer the message to the network relay
+     }
+ 
++    // Tessera start - relay signed chat to the rest of the network
++    /**
++     * Receives every locally-broadcast signed message so a plugin can forward it to the network's
++     * other backends, where {@code ServerGamePacketListenerImpl.tesseraDeliverRemoteChat} replays it.
++     *
++     * A relayed message stays genuinely signed, which is the whole point: the client verifies it
++     * against the sender's own Mojang-issued key, so it renders without a trust marker, can be
++     * reported, can be deleted with {@code ClientboundDeleteChatPacket}, and obeys the client's own
++     * "hide messages from this player" setting — none of which a system message can do.
++     *
++     * Unsigned messages and senders without a chat session are skipped: there would be nothing to
++     * verify on the other side, so they may as well travel as system messages.
++     */
++    public static volatile java.util.function.Consumer<byte[]> tesseraChatRelay = null;
++
++    public static final int TESSERA_CHAT_RELAY_VERSION = 1;
++
++    /**
++     * Serialises everything the receiving backend needs to replay this message as genuine signed
++     * chat. Opaque bytes so the relay plugin never touches an NMS type.
++     *
++     * <p>The bound chat type travels as a registry key plus the sender's plain name rather than the
++     * rendered display name component: relayed messages therefore arrive in vanilla
++     * {@code <name> text} form. Carrying per-viewer formatting is a separate problem — it belongs to
++     * whatever renders chat, not to the transport.
++     */
++    private static byte[] tesseraEncodeChat(
++        final ServerPlayer sender, final net.minecraft.network.chat.PlayerChatMessage message, final ChatType.Bound chatType
++    ) {
++        final net.minecraft.network.FriendlyByteBuf out = new net.minecraft.network.FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
++        try {
++            out.writeVarInt(TESSERA_CHAT_RELAY_VERSION);
++            out.writeUUID(sender.getUUID());
++            out.writeUtf(sender.getGameProfile().name());
++            net.minecraft.network.chat.RemoteChatSession.Data.write(out, java.util.Objects.requireNonNull(sender.getChatSession()).asData());
++            out.writeVarInt(message.link().index());
++            out.writeUtf(chatType.chatType().unwrapKey().orElse(ChatType.CHAT).identifier().toString());
++            // The bound name and the decorated content travel as components, not as the sender's
++            // plain name: they are what a chat plugin's renderer produced, so carrying them is what
++            // keeps a relayed line looking like the local one instead of falling back to vanilla
++            // "<name> text". The context-free codec avoids needing registry access on either side.
++            net.minecraft.network.chat.ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC.encode(out, chatType.name());
++            out.writeOptional(chatType.targetName(), net.minecraft.network.chat.ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC::encode);
++            out.writeNullable(message.unsignedContent(), net.minecraft.network.chat.ComponentSerialization.TRUSTED_CONTEXT_FREE_STREAM_CODEC::encode);
++            out.writeNullable(message.signature(), net.minecraft.network.chat.MessageSignature::write);
++
++            final net.minecraft.network.chat.SignedMessageBody body = message.signedBody();
++            out.writeUtf(body.content(), 256);
++            out.writeLong(body.timeStamp().toEpochMilli());
++            out.writeLong(body.salt());
++            out.writeCollection(body.lastSeen().entries(), net.minecraft.network.chat.MessageSignature::write);
++
++            final byte[] bytes = new byte[out.readableBytes()];
++            out.readBytes(bytes);
++            return bytes;
++        } finally {
++            out.release();
++        }
++    }
++    // Tessera end - relay signed chat to the rest of the network
++
+     public boolean verifyChatTrusted(final PlayerChatMessage message) {
+         return message.hasSignature() && !message.hasExpiredServer(Instant.now());
+     }
