@@ -1,0 +1,93 @@
+# Publish the paperclip jar to R2 so Tessera can serve it as a server build.
+#
+# There was no publish step: build.yml applies the patches, builds, and stops — so every
+# folia-kotlin jar that reached R2 was uploaded by hand. That is how the seamless-switch patches
+# ended up merged here while the network kept running a jar built one commit earlier: the shards
+# logged "server is not Tessera-patched (PlayerList.tesseraEntityIdPin missing)" and players saw
+# the terrain-loading screen on every shard hop, with nothing in the pack to suggest why.
+#
+# The object key is what a pack pin resolves against. servers/registry.yaml in tessera-packs maps
+# `server: folia@<version>` to r2://tessera-plugins/releases/folia-kotlin-<version>.jar.
+name: Publish to R2
+
+on:
+  push:
+    # This fork branches per Minecraft version (ver/26.2.x is the default), never `main`.
+    branches: ["ver/**"]
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: >-
+          Appended to mcVersion for the object key. Defaults to "seamless"; pass an empty string
+          only if you really mean to overwrite the plain folia-kotlin-<mcVersion>.jar.
+        required: false
+        default: seamless
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # paperweight rewrites history while patching, so it needs an identity even though nothing
+      # is pushed back.
+      - name: Configure Git user details
+        run: git config --global user.email "actions@github.com" && git config --global user.name "Github Actions"
+
+      - name: Apply patches
+        run: ./gradlew applyAllPatches --stacktrace
+
+      # Paperclip, not the bundler: it is self-bootstrapping, which is what itzg TYPE=CUSTOM with a
+      # mounted server.jar needs.
+      - name: Build the paperclip jar
+        run: ./gradlew :folia-server:createPaperclipJar --stacktrace
+
+      - name: Resolve version and locate the jar
+        id: jar
+        run: |
+          set -euo pipefail
+          # mcVersion is the same property servers/registry.yaml keys its `folia` versions on.
+          version="$(./gradlew -q properties | awk -F': ' '/^mcVersion:/ {print $2; exit}')"
+          [ -n "$version" ] || { echo "::error::could not read mcVersion"; exit 1; }
+          # ⚠ NEVER publish under the bare mcVersion by default: r2://…/folia-kotlin-26.2.jar is
+          # the jar survival-prod's shards pin, and overwriting it would swap production's server
+          # to a patched build with no pack change and nothing in the pin to show it.
+          suffix="${{ inputs.version_suffix }}"
+          [ "${{ github.event_name }}" = "push" ] && suffix="seamless"
+          [ -n "$suffix" ] && version="$version-$suffix"
+          path="$(find folia-server/build/libs -name '*paperclip*.jar' -print -quit)"
+          [ -n "$path" ] || { echo "::error::no paperclip jar under folia-server/build/libs"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Publishing $path as folia-kotlin-$version.jar"
+
+      - name: Upload to R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          chmod +x /tmp/mc
+          /tmp/mc alias set r2 "$R2_ENDPOINT" "$R2_ACCESS_KEY" "$R2_SECRET_KEY" >/dev/null
+          /tmp/mc cp "${{ steps.jar.outputs.path }}" \
+            "r2/tessera-plugins/releases/folia-kotlin-${{ steps.jar.outputs.version }}.jar"
+          /tmp/mc stat "r2/tessera-plugins/releases/folia-kotlin-${{ steps.jar.outputs.version }}.jar"
+
+      - name: Report the sha256
+        run: |
+          echo "sha256: $(sha256sum '${{ steps.jar.outputs.path }}' | cut -d' ' -f1)"
+          echo "registry entry: r2://tessera-plugins/releases/folia-kotlin-${{ steps.jar.outputs.version }}.jar"
