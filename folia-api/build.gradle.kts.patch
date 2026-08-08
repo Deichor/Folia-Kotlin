@@ -4,7 +4,7 @@
      testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.3")
 +
 +    // Kotlin (Server Runtime)
-+    val kotlinVersion = "2.3.0"
++    val kotlinVersion = "2.4.0"
 +    val coroutinesVersion = "1.10.2"
 +    implementation("org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion")
 +    implementation("org.jetbrains.kotlin:kotlin-reflect:$kotlinVersion")
