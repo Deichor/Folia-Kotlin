@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Deichor <deichors@gmail.com>
+Date: Wed, 12 Aug 2026 21:25:36 +0300
+Subject: [PATCH] Sync weather to the client on a seamless backend switch
+
+
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 57f93d978fe48fdf6e77b7bfb9f1de060e1a8524..ea41000849e3559931a4da4ebca2d3dea6206b7c 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -3592,6 +3592,42 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+         this.setPlayerWeather(this.level().isRaining() ? org.bukkit.WeatherType.DOWNFALL : org.bukkit.WeatherType.CLEAR, false);
+     }
+ 
++    // Tessera start - seamless backend switching
++    /**
++     * Sends this player their current weather in full, whatever it is and whatever the client
++     * already believes.
++     *
++     * <p>Every other path here is written for a client whose weather is known:
++     * {@link net.minecraft.server.players.PlayerList#sendLevelInfo} stays silent unless the level is
++     * raining, because a joining client has just built a fresh clear {@code ClientLevel}, and
++     * {@link #updateWeather} emits only on a change. A client that arrived through a seamless proxy
++     * switch fits neither — it was sent no Login and no Respawn, so it still carries the rain and
++     * thunder of the backend it left, and nothing here would correct it until this level's weather
++     * next moves on its own.
++     *
++     * <p>The rain and thunder levels go out beside the start/stop event because the client only
++     * moves them when told to; the event alone would leave a client at a steadily raining shard
++     * believing it rains while rendering nothing.
++     */
++    public void tesseraSendWeather() {
++        final org.bukkit.WeatherType type = this.weatherType != null
++            ? this.weatherType
++            : (this.level().isRaining() ? org.bukkit.WeatherType.DOWNFALL : org.bukkit.WeatherType.CLEAR);
++        // A player under a plugin override keeps it: pass the override back as a plugin call, which
++        // re-sends it rather than letting the level overwrite it.
++        this.setPlayerWeather(type, this.weatherType != null);
++
++        // Same sources updateWeather() draws on, so an override player is told about their own ramp
++        // and everyone else about the level's — but sent unconditionally.
++        final float rain = this.weatherType != null ? this.pluginRainPosition : this.level().rainLevel;
++        final float thunder = this.weatherType == null || this.weatherType == org.bukkit.WeatherType.DOWNFALL
++            ? this.level().thunderLevel
++            : 0.0F;
++        this.connection.send(new ClientboundGameEventPacket(ClientboundGameEventPacket.RAIN_LEVEL_CHANGE, rain));
++        this.connection.send(new ClientboundGameEventPacket(ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE, thunder));
++    }
++    // Tessera end
++
+     @Override
+     public String toString() {
+         return super.toString() + "(" + this.getScoreboardName() + " at " + this.getX() + "," + this.getY() + "," + this.getZ() + ")";
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 2ee9330d18e97819e7f8b9b1adb97b7b8cc3902f..15878a8ca918454912a391fc937f302195a496a0 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -4175,6 +4175,16 @@ public class ServerGamePacketListenerImpl
+     public void tesseraMarkClientLoaded() {
+         this.markClientLoaded(false);
+     }
++
++    /**
++     * Re-sends the weather, which a seamless arrival carries over from the backend it left.
++     *
++     * <p>Called by the Tessera plugin on the arrival message; see
++     * {@link ServerPlayer#tesseraSendWeather()} for why the join sequence does not cover this.
++     */
++    public void tesseraSyncWeather() {
++        this.player.tesseraSendWeather();
++    }
+     // Tessera end
+ 
+     public void markClientUnloadedAfterDeath() {
