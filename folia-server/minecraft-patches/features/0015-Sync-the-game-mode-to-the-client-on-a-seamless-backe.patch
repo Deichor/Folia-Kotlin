@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vulzen <vulzen@vulzen.dev>
+Date: Fri, 14 Aug 2026 04:42:39 +0300
+Subject: [PATCH] Sync the game mode to the client on a seamless backend switch
+
+
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 15878a8ca918454912a391fc937f302195a496a0..c6cb0a84c229b2d5a4a3e6b0e0a2245f3458427f 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -4185,6 +4185,30 @@ public class ServerGamePacketListenerImpl
+     public void tesseraSyncWeather() {
+         this.player.tesseraSendWeather();
+     }
++
++    /**
++     * Re-asserts this player's game mode on the client, whatever the client already believes.
++     *
++     * <p>The game mode reaches a client on {@code ClientboundLoginPacket}, which a seamless switch
++     * swallows: the client keeps the mode the backend it left last gave it, while this server
++     * enforces the one it loaded from the player's data. Nothing corrects that afterwards, because
++     * every ordinary path is written for a mode that is *changing* —
++     * {@link net.minecraft.server.level.ServerPlayerGameMode#changeGameModeForPlayer} returns early
++     * when the new mode equals the current one, so {@link net.minecraft.server.level.ServerPlayer#setGameMode}
++     * never reaches its send, and a plugin re-setting the mode it already holds is a no-op.
++     *
++     * <p>The abilities follow, and the order matters: the client derives its own abilities from the
++     * mode it is told ({@code GameType.updatePlayerAbilities} runs client-side on this event), so
++     * sending the mode alone would silently revoke a flight this server still grants — a survival
++     * player with plugin-granted flight would stop being able to fly on every switch.
++     */
++    public void tesseraSyncGameMode() {
++        this.send(new net.minecraft.network.protocol.game.ClientboundGameEventPacket(
++            net.minecraft.network.protocol.game.ClientboundGameEventPacket.CHANGE_GAME_MODE,
++            this.player.gameMode.getGameModeForPlayer().getId()
++        ));
++        this.player.onUpdateAbilities();
++    }
+     // Tessera end
+ 
+     public void markClientUnloadedAfterDeath() {
