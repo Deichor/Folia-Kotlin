@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vulzen <vulzen@vulzen.dev>
+Date: Sun, 16 Aug 2026 15:58:36 +0300
+Subject: [PATCH] Sync the client-visible game rules on a seamless backend
+ switch
+
+
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index c6cb0a84c229b2d5a4a3e6b0e0a2245f3458427f..5a64470e81c43589fdaf21ab20a73951cb35fd0d 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -4209,6 +4209,40 @@ public class ServerGamePacketListenerImpl
+         ));
+         this.player.onUpdateAbilities();
+     }
++
++    /**
++     * Re-sends the three game rules a client is ever told about, whatever it already believes.
++     *
++     * <p>{@code reducedDebugInfo}, {@code immediateRespawn} and {@code doLimitedCrafting} reach a
++     * client only on {@code ClientboundLoginPacket} (see
++     * {@link net.minecraft.server.players.PlayerList#placeNewPlayer}), which a seamless switch
++     * swallows, so the client keeps the values of the backend it left. Afterwards only a change
++     * corrects it: {@link net.minecraft.server.MinecraftServer#onGameRuleChanged} fires when the
++     * rule itself moves, and the CraftBukkit block in
++     * {@link net.minecraft.server.players.PlayerList#sendAllPlayerInfo} runs only on a respawn or a
++     * dimension change — a switch is neither. A player leaving a world with
++     * {@code reducedDebugInfo} on would keep a stripped F3 on every server they switch to for the
++     * rest of the session.
++     *
++     * <p>Game rules are per world here, so they are read off the player's own level. The packets
++     * and their encoding mirror {@code onGameRuleChanged}; {@code doLimitedCrafting} is included
++     * because {@code sendAllPlayerInfo} never sends it at all.
++     */
++    public void tesseraSyncGameRules() {
++        final net.minecraft.world.level.gamerules.GameRules gameRules = this.player.level().getGameRules();
++        this.send(new net.minecraft.network.protocol.game.ClientboundEntityEventPacket(
++            this.player,
++            (byte) (gameRules.get(net.minecraft.world.level.gamerules.GameRules.REDUCED_DEBUG_INFO) ? 22 : 23)
++        ));
++        this.send(new net.minecraft.network.protocol.game.ClientboundGameEventPacket(
++            net.minecraft.network.protocol.game.ClientboundGameEventPacket.IMMEDIATE_RESPAWN,
++            gameRules.get(net.minecraft.world.level.gamerules.GameRules.IMMEDIATE_RESPAWN) ? 1.0F : 0.0F
++        ));
++        this.send(new net.minecraft.network.protocol.game.ClientboundGameEventPacket(
++            net.minecraft.network.protocol.game.ClientboundGameEventPacket.LIMITED_CRAFTING,
++            gameRules.get(net.minecraft.world.level.gamerules.GameRules.LIMITED_CRAFTING) ? 1.0F : 0.0F
++        ));
++    }
+     // Tessera end
+ 
+     public void markClientUnloadedAfterDeath() {
