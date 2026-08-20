@@ -138,7 +138,7 @@ index 9395c6a58ba37fb00c492065b8045f54de0a2246..533852572c71fb33b5c31ca192612546
          return body -> {
              SignedMessageLink link = this.nextLink;
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b8cc3902f 100644
+index f3811b3d3fd1ef91951560ff76920a51f48e3b77..908d981ef3470bd7520625aaed140078981dffc5 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 @@ -50,8 +50,16 @@ import net.minecraft.network.HashedStack;
@@ -204,12 +204,14 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
          this.chatMessageChain
              .append(
                  () -> {
-@@ -3821,6 +3843,260 @@ public class ServerGamePacketListenerImpl
+@@ -3821,6 +3843,313 @@ public class ServerGamePacketListenerImpl
              );
      }
  
 +    // Tessera start - hand the connection's chat state to the next backend
-+    private static final int TESSERA_CHAT_STATE_VERSION = 1;
++    private static final int TESSERA_CHAT_STATE_VERSION = 2;
++    // v1 carried a chat session and nothing without one; still read so a rolling deploy keeps working.
++    private static final int TESSERA_CHAT_STATE_VERSION_LEGACY = 1;
 +    private static final int TESSERA_CHAT_STATE_WARN_ENTRIES = 256;
 +
 +    /**
@@ -222,26 +224,36 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
 +     * starts fresh disagrees on all three and the player is kicked or silently loses chat. Everything
 +     * needed to agree is held here, so the source exports and the destination imports it.
 +     *
++     * <p>Only the chat session, and the {@link SignedMessageChain} built from it, are session-bound:
++     * they sign the messages this player sends. The other three belong to the connection and matter
++     * just as much to a client that never sent a profile key — {@code nextChatIndex} is the global
++     * index stamped on every chat packet sent to this client, and the client kicks itself on a gap in
++     * it; {@code messageSignatureCache} packs and unpacks the signed bodies this connection receives;
++     * {@code lastSeenMessages} is the acknowledgement window, which the client advances for every
++     * signed message it saw, whatever key it holds itself. So those three are always carried and the
++     * session is written as an optional tail: dropping them for a keyless or Bedrock client kicks it
++     * with {@code out_of_order_chat} as soon as anybody else speaks.
++     *
++     * <p>Dropping them costs two different kicks, and only one of them is prompt. The acknowledgement
++     * window fails at once: {@code chat_validation_failed} about a second after the switch, before
++     * the player has typed anything. The global index fails late, and passively — the client checks
++     * it against a {@code ClientboundPlayerChatPacket} it receives, so
++     * {@code multiplayer.disconnect.out_of_order_chat} waits on somebody else speaking, which on the
++     * cluster this was found on meant nearly two minutes. The player need never have typed at all;
++     * nothing they do brings it on or holds it off. That makes it easy to mistake for a broken
++     * signing chain, which is the session-bound failure, does answer to what the player sends, and
++     * reports itself as {@code chat.disabled.invalid_signature}. The index kick is indifferent to
++     * whether they hold a key, which is why it reaches keyless and Bedrock clients too.
++     *
 +     * Opaque bytes on purpose: the transport is a plugin, and keeping the format inside the server
 +     * means no NMS type ever has to cross a plugin classloader.
 +     *
-+     * @return the snapshot, or an empty array when the player has no chat session (offline mode, or a
-+     *         client that sent no profile key) and therefore nothing to carry.
++     * @return the snapshot, never empty
 +     */
 +    public byte[] tesseraExportChatState() {
-+        final RemoteChatSession session = this.chatSession;
-+        if (session == null) {
-+            return new byte[0];
-+        }
-+
 +        final FriendlyByteBuf out = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
 +        try {
 +            out.writeVarInt(TESSERA_CHAT_STATE_VERSION);
-+            RemoteChatSession.Data.write(out, session.asData());
-+
-+            final SignedMessageChain chain = this.signedMessageChain;
-+            out.writeVarInt(chain == null ? -1 : chain.tesseraNextIndex());
-+            out.writeLong(chain == null ? 0L : chain.tesseraLastTimeStamp().toEpochMilli());
 +            out.writeVarInt(this.nextChatIndex);
 +
 +            synchronized (this.messageSignatureCache) {
@@ -277,6 +289,17 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
 +                out.writeNullable(this.lastSeenMessages.tesseraLastPending(), MessageSignature::write);
 +            }
 +
++            // Optional tail: absent for a client that sent no profile key, one whose key expired, and
++            // for a Bedrock player behind a translation proxy.
++            final RemoteChatSession session = this.chatSession;
++            out.writeBoolean(session != null);
++            if (session != null) {
++                RemoteChatSession.Data.write(out, session.asData());
++                final SignedMessageChain chain = this.signedMessageChain;
++                out.writeVarInt(chain == null ? -1 : chain.tesseraNextIndex());
++                out.writeLong(chain == null ? 0L : chain.tesseraLastTimeStamp().toEpochMilli());
++            }
++
 +            final byte[] bytes = new byte[out.readableBytes()];
 +            out.readBytes(bytes);
 +            return bytes;
@@ -290,6 +313,16 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
 +     * left. Must run on the main thread and before the client sends anything, which is why the caller
 +     * is the seamless-arrival handler rather than the join sequence.
 +     *
++     * <p>The connection's own fields are applied first and unconditionally. Every way the session can
++     * turn out unusable — no Services key to check it against, a signature that no longer validates,
++     * or no session in the snapshot at all — skips the session setup only; it must never skip the
++     * global index, the signature cache or the acknowledgement window, or the player is kicked with
++     * {@code chat_validation_failed} within a second and with {@code out_of_order_chat} whenever the
++     * next chat message happens to reach them.
++     *
++     * <p>Reads v1 as well, so that a rolling deploy can run both formats side by side. v1 always
++     * carried a session and wrote it first; v2 makes it an optional tail.
++     *
 +     * @throws IllegalArgumentException if the snapshot is malformed or from a newer server
 +     */
 +    public void tesseraImportChatState(final byte[] snapshot) {
@@ -299,29 +332,20 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
 +
 +        final FriendlyByteBuf in = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapshot));
 +        final int version = in.readVarInt();
-+        if (version != TESSERA_CHAT_STATE_VERSION) {
++        if (version != TESSERA_CHAT_STATE_VERSION && version != TESSERA_CHAT_STATE_VERSION_LEGACY) {
 +            throw new IllegalArgumentException("Unsupported chat state version " + version);
 +        }
++        final boolean legacy = version == TESSERA_CHAT_STATE_VERSION_LEGACY;
 +
-+        final SignatureValidator serviceKeyValidator = this.server.services().profileKeySignatureValidator();
-+        if (serviceKeyValidator == null) {
-+            LOGGER.warn("Ignoring chat state for {}: no Services public key to validate it against", this.player.getGameProfile().name());
-+            return;
++        RemoteChatSession.Data sessionData = null;
++        int chainIndex = -1;
++        long lastTimeStamp = 0L;
++        if (legacy) {
++            sessionData = RemoteChatSession.Data.read(in);
++            chainIndex = in.readVarInt();
++            lastTimeStamp = in.readLong();
 +        }
 +
-+        final RemoteChatSession session;
-+        try {
-+            session = RemoteChatSession.Data.read(in).validate(this.player.getGameProfile(), serviceKeyValidator);
-+        } catch (final ProfilePublicKey.ValidationException e) {
-+            // A session that does not validate here would not have validated on the source either, so
-+            // this is a transport bug rather than a hostile client; drop the state and let the player
-+            // fall back to unsigned chat instead of disconnecting them.
-+            LOGGER.warn("Ignoring chat state for {}: {}", this.player.getGameProfile().name(), e.getMessage());
-+            return;
-+        }
-+
-+        final int chainIndex = in.readVarInt();
-+        final Instant lastTimeStamp = Instant.ofEpochMilli(in.readLong());
 +        final int nextChatIndex = in.readVarInt();
 +
 +        final int cachedCount = in.readVarInt();
@@ -337,19 +361,48 @@ index f3811b3d3fd1ef91951560ff76920a51f48e3b77..2ee9330d18e97819e7f8b9b1adb97b7b
 +        }
 +        final MessageSignature lastPending = in.readNullable(MessageSignature::read);
 +
-+        this.chatSession = session;
-+        this.hasLoggedExpiry = false;
-+        this.signedMessageChain = new SignedMessageChain(this.player.getUUID(), session.sessionId());
-+        this.signedMessageChain.tesseraResumeAt(chainIndex, lastTimeStamp);
-+        this.signedMessageDecoder = this.signedMessageChain.decoder(session.profilePublicKey());
-+        this.nextChatIndex = nextChatIndex;
++        if (!legacy && in.readBoolean()) {
++            sessionData = RemoteChatSession.Data.read(in);
++            chainIndex = in.readVarInt();
++            lastTimeStamp = in.readLong();
++        }
 +
++        // Applied first, and never skipped when the session turns out to be absent or unusable: these
++        // three describe the connection, not the session, and a client without one still counts them.
++        this.nextChatIndex = nextChatIndex;
 +        synchronized (this.messageSignatureCache) {
 +            this.messageSignatureCache.tesseraImport(cached);
 +        }
 +        synchronized (this.lastSeenMessages) {
 +            this.lastSeenMessages.tesseraImport(tracked, lastPending);
 +        }
++
++        if (sessionData == null) {
++            return;
++        }
++
++        final SignatureValidator serviceKeyValidator = this.server.services().profileKeySignatureValidator();
++        if (serviceKeyValidator == null) {
++            LOGGER.warn("Ignoring the chat session of {}: no Services public key to validate it against", this.player.getGameProfile().name());
++            return;
++        }
++
++        final RemoteChatSession session;
++        try {
++            session = sessionData.validate(this.player.getGameProfile(), serviceKeyValidator);
++        } catch (final ProfilePublicKey.ValidationException e) {
++            // A session that does not validate here would not have validated on the source either, so
++            // this is a transport bug rather than a hostile client; drop the session and let the
++            // player fall back to unsigned chat instead of disconnecting them.
++            LOGGER.warn("Ignoring the chat session of {}: {}", this.player.getGameProfile().name(), e.getMessage());
++            return;
++        }
++
++        this.chatSession = session;
++        this.hasLoggedExpiry = false;
++        this.signedMessageChain = new SignedMessageChain(this.player.getUUID(), session.sessionId());
++        this.signedMessageChain.tesseraResumeAt(chainIndex, Instant.ofEpochMilli(lastTimeStamp));
++        this.signedMessageDecoder = this.signedMessageChain.decoder(session.profilePublicKey());
 +
 +        this.player.setChatSession(session);
 +        this.server

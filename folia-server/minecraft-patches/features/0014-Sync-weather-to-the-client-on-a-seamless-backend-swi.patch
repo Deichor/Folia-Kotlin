@@ -52,10 +52,10 @@ index 57f93d978fe48fdf6e77b7bfb9f1de060e1a8524..ea41000849e3559931a4da4ebca2d3de
      public String toString() {
          return super.toString() + "(" + this.getScoreboardName() + " at " + this.getX() + "," + this.getY() + "," + this.getZ() + ")";
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index 2ee9330d18e97819e7f8b9b1adb97b7b8cc3902f..15878a8ca918454912a391fc937f302195a496a0 100644
+index 908d981ef3470bd7520625aaed140078981dffc5..255f4cc8c3f4bb1cc34ee7148b8810ce75db2b7b 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-@@ -4175,6 +4175,16 @@ public class ServerGamePacketListenerImpl
+@@ -4228,6 +4228,16 @@ public class ServerGamePacketListenerImpl
      public void tesseraMarkClientLoaded() {
          this.markClientLoaded(false);
      }

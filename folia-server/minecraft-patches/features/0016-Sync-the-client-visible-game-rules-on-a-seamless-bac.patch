@@ -6,10 +6,10 @@ Subject: [PATCH] Sync the client-visible game rules on a seamless backend
 
 
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index c6cb0a84c229b2d5a4a3e6b0e0a2245f3458427f..5a64470e81c43589fdaf21ab20a73951cb35fd0d 100644
+index b4b995e78f72afacc3a9ede89ff3bfd83b4dd51c..8dddc1131a10960539a272b49cc0e93a81279a8d 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-@@ -4209,6 +4209,40 @@ public class ServerGamePacketListenerImpl
+@@ -4262,6 +4262,40 @@ public class ServerGamePacketListenerImpl
          ));
          this.player.onUpdateAbilities();
      }

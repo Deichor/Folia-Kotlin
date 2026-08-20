@@ -5,10 +5,10 @@ Subject: [PATCH] Sync the game mode to the client on a seamless backend switch
 
 
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index 15878a8ca918454912a391fc937f302195a496a0..c6cb0a84c229b2d5a4a3e6b0e0a2245f3458427f 100644
+index 255f4cc8c3f4bb1cc34ee7148b8810ce75db2b7b..b4b995e78f72afacc3a9ede89ff3bfd83b4dd51c 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-@@ -4185,6 +4185,30 @@ public class ServerGamePacketListenerImpl
+@@ -4238,6 +4238,30 @@ public class ServerGamePacketListenerImpl
      public void tesseraSyncWeather() {
          this.player.tesseraSendWeather();
      }
