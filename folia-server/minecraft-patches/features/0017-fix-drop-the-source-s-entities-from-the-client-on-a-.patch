@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Deichor <deichors@gmail.com>
+Date: Mon, 24 Aug 2026 22:32:41 +0300
+Subject: [PATCH] fix: drop the source's entities from the client on a seamless
+ switch
+
+
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index 163999d50213e0167eb09f0eae883388849f28fa..1db9c9f6eb286608ec9338d86246961fc8937da1 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1340,6 +1340,14 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+ 
+         public void updatePlayer(final ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker update"); // Spigot
++            // Tessera start - seamless backend switching
++            // A player the proxy has told us is leaving keeps nothing: the sweep that emptied their
++            // client would otherwise be undone here on the very next tracker tick.
++            if (player.tesseraIsDeparting()) {
++                this.removePlayer(player);
++                return;
++            }
++            // Tessera end
+             if (player != this.entity) {
+                 // Paper start - remove allocation of Vec3D here
+                 // Vec3 deltaToPlayer = player.position().subtract(this.entity.position());
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index ea41000849e3559931a4da4ebca2d3dea6206b7c..4354607eed8e4edebce3e4a24d2e829ad4f01a48 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -3626,6 +3626,61 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+         this.connection.send(new ClientboundGameEventPacket(ClientboundGameEventPacket.RAIN_LEVEL_CHANGE, rain));
+         this.connection.send(new ClientboundGameEventPacket(ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE, thunder));
+     }
++
++    /** How long a departure keeps the tracker off this client before it is allowed to refill it. */
++    private static final long TESSERA_DEPART_GRACE_NANOS = 5L * 1000L * 1000L * 1000L;
++
++    private boolean tesseraDeparting;
++    private long tesseraDepartingSince;
++
++    /**
++     * Tells this client to forget every entity this server has shown it, and holds the tracker off
++     * until the connection is gone.
++     *
++     * <p>A seamless proxy switch sends the client no Login and no Respawn — the only two things
++     * that rebuild a {@code ClientLevel} — so the client carries this server's entity storage into
++     * the next one. The destination handed out none of those ids and never removes them, so this
++     * server's mobs, item frames and players stay on screen for the rest of the session, frozen,
++     * while the client's interactions carry ids that mean nothing on the destination or, where they
++     * collide with its own, mean a different entity than the one the player is looking at.
++     *
++     * <p>The removal packets already exist: {@link ChunkMap#removeEntity} sends exactly these when
++     * the player leaves. That runs after the proxy has closed this connection, so they go nowhere.
++     * This is the same sweep run early — the proxy warns the source on {@code
++     * tessera:seamless-depart} before it connects the destination, which is the last moment this
++     * connection can still say anything.
++     *
++     * <p>The flag matters as much as the sweep: the player stays here for a few more ticks and the
++     * tracker would re-pair everything on the next one. It expires on its own so a switch that
++     * fails and leaves the player here recovers by itself, on the tick after.
++     */
++    public void tesseraDropTrackedEntities() {
++        this.tesseraDepartingSince = System.nanoTime();
++        this.tesseraDeparting = true;
++        // Copied because removePairing fires PlayerUntrackEntityEvent, and a listener that spawns or
++        // removes an entity would otherwise be mutating the list underneath us.
++        for (final Entity entity : this.level().getCurrentWorldData().getLocalEntitiesCopy()) {
++            final ChunkMap.TrackedEntity tracked = entity.moonrise$getTrackedEntity();
++            if (tracked != null) {
++                tracked.removePlayer(this);
++            }
++        }
++    }
++
++    /**
++     * Whether the tracker should leave this client empty. Read once per tracked entity per tick, so
++     * the flag is checked before the clock.
++     */
++    public boolean tesseraIsDeparting() {
++        if (!this.tesseraDeparting) {
++            return false;
++        }
++        if (System.nanoTime() - this.tesseraDepartingSince < TESSERA_DEPART_GRACE_NANOS) {
++            return true;
++        }
++        this.tesseraDeparting = false;
++        return false;
++    }
+     // Tessera end
+ 
+     @Override
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 8dddc1131a10960539a272b49cc0e93a81279a8d..ff9f719b7c8d667168a4d5dc4e7e940e8dae0013 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -4296,6 +4296,18 @@ public class ServerGamePacketListenerImpl
+             gameRules.get(net.minecraft.world.level.gamerules.GameRules.LIMITED_CRAFTING) ? 1.0F : 0.0F
+         ));
+     }
++
++    /**
++     * Drops every entity this client is holding, so a seamless switch does not carry this server's
++     * mobs and players to the next one as unmovable ghosts.
++     *
++     * <p>Called by the Tessera plugin on the departure message, not the arrival one: the
++     * destination cannot do this, because the ids belong to this server and it never learns them.
++     * See {@link ServerPlayer#tesseraDropTrackedEntities()}.
++     */
++    public void tesseraUntrackEntities() {
++        this.player.tesseraDropTrackedEntities();
++    }
+     // Tessera end
+ 
+     public void markClientUnloadedAfterDeath() {
