@@ -1,6 +1,6 @@
 --- a/paper-api/build.gradle.kts
 +++ b/paper-api/build.gradle.kts
-@@ -94,7 +_,22 @@
+@@ -94,7 +_,27 @@
      testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.3")
 +
 +    // Kotlin (Server Runtime)
@@ -16,7 +16,13 @@
 +    // classloader whose only parent is the server, so classes shared between plugins have to come
 +    // from here — otherwise each plugin gets its own Redisson and, with it, its own connection
 +    // pool, Netty group, completion pool and timer thread against the same Redis.
-+    implementation("org.redisson:redisson:4.5.0")
++    implementation("org.redisson:redisson:4.5.0") {
++        // Paper pins snakeyaml 2.2 here and Redisson asks for 2.6, which won the conflict and
++        // took org.yaml.snakeyaml.external.biz.base64Coder with it — removed in 2.4, still
++        // imported by Bukkit's object-stream tests, so the API stopped compiling. Redisson only
++        // reads YAML in Config.fromYAML, which nothing on this server calls.
++        exclude(group = "org.yaml", module = "snakeyaml")
++    }
  }
  
 -val generatedDir: java.nio.file.Path = layout.projectDirectory.dir("src/generated/java").asFile.toPath()
